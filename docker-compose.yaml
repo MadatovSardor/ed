@@ -1,92 +1,435 @@
-name: ed
+# ============================================================================
+#  ED marketplace — lokal infratuzilma
+# ============================================================================
+#  Bu fayl ILOVANI ko'tarmaydi. Faqat ilova tayanadigan tashqi tizimlarni:
+#  PostgreSQL, Keycloak, Kafka, RabbitMQ, Redis va monitoring stekini.
+#
+#  Sabab: dars paytida ilovani IDE'dan (`./gradlew :app:bootRun`) ishga
+#  tushiramiz — breakpoint qo'yish, hot reload, log'ni to'g'ridan-to'g'ri
+#  ko'rish uchun. Ilova konteynerda bo'lsa bularning hammasi qiyinlashadi.
+#
+#  Shu sababdan barcha portlar HOST mashinaga chiqarilgan va ilova ularga
+#  `localhost:<port>` orqali ulanadi (app/src/main/resources/application.yml
+#  dagi manzillar bilan ayni bir xil).
+#
+#  Ishga tushirish:  docker compose up -d
+#  To'xtatish:       docker compose down
+#  Hammasini o'chirish (ma'lumot bilan birga): docker compose down -v
+# ============================================================================
 
 services:
+
+  # --------------------------------------------------------------------------
+  # PostgreSQL — ilovaning asosiy bazasi
+  # --------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
+    container_name: ed-postgres
     environment:
       POSTGRES_DB: ed_db
       POSTGRES_USER: user_ed
       POSTGRES_PASSWORD: root123
-    ports: ["5432:5432"]
-    volumes: ["pg:/var/lib/postgresql/data"]
+      # initdb'ga argument: solishtirish (collation) muammolarini oldini oladi.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Chap tomon — host porti (ilova shu yerga ulanadi), o'ng tomon — konteyner ichida.
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
+      # pg_isready — postgres ulanishga tayyormi. Faqat "konteyner ishlayapti"
+      # emas, "baza so'rov qabul qiladi" degani. Flyway migratsiyasi shusiz yiqiladi.
       test: ["CMD-SHELL", "pg_isready -U user_ed -d ed_db"]
       interval: 5s
+      timeout: 3s
       retries: 10
+      start_period: 10s
+    command:
+      # Dars paytida sekin so'rovlarni ko'rsatish uchun: 200ms dan uzun
+      # har bir SQL log'ga tushadi (N+1 muammosini ko'zga ko'rinadigan qiladi).
+      - "postgres"
+      - "-c"
+      - "log_min_duration_statement=200"
+      - "-c"
+      - "max_connections=100"
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # Keycloak uchun ALOHIDA PostgreSQL
+  # --------------------------------------------------------------------------
+  # Nega alohida? Identity provayder — mustaqil tizim. Uning jadvallari
+  # (user, credential, session) bizning `ed_db` bazasida turmasligi kerak:
+  #   1. `docker compose down -v` bilan ed_db bazasini tozalaganda
+  #      foydalanuvchilar ham o'chib ketmasin;
+  #   2. prod'da Keycloak odatda butunlay boshqa serverda turadi — lokalda ham
+  #      shu chegarani saqlab, "bir baza — bir egasi" qoidasini o'rgatamiz.
   keycloak-db:
     image: postgres:16-alpine
+    container_name: ed-keycloak-db
     environment:
-      POSTGRES_DB: kc_db
+      POSTGRES_DB: keycloak_db
       POSTGRES_USER: user_keycloak
       POSTGRES_PASSWORD: root123
-    volumes: ["kcdb:/var/lib/postgresql/data"]
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    # Portni HOST'ga chiqarmaymiz: bu bazaga faqat Keycloak murojaat qiladi.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user_keycloak -d keycloak_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # Keycloak 25 — OAuth2 / OIDC provayder
+  # --------------------------------------------------------------------------
   keycloak:
-    image: quay.io/keycloak/keycloak:25.0
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: ed-keycloak
+    # start-dev — HTTPS talab qilmaydigan, tez ko'tariladigan dev rejimi.
+    # --import-realm — /opt/keycloak/data/import ichidagi realm JSON larini
+    # BIRINCHI ko'tarilishda import qiladi. Keyingi safar baza bo'sh bo'lmaydi,
+    # shuning uchun import o'tkazib yuboriladi (realm'ni qayta import qilish
+    # kerak bo'lsa: docker compose down -v).
     command: ["start-dev", "--import-realm"]
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: root123
+      KEYCLOAK_ADMIN_PASSWORD: admin
       KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/kc_db
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak_db
       KC_DB_USERNAME: user_keycloak
       KC_DB_PASSWORD: root123
+      # ENG MUHIM QATOR: konteyner ichidagi port ham 8081.
+      # Agar ichkarida 8080 bo'lib, tashqariga 8081 deb chiqarsak, Keycloak
+      # token'ning `iss` (issuer) maydoniga `http://localhost:8080/realms/ed`
+      # yozadi. Backend esa application.yml da `localhost:8081` ni kutadi —
+      # va har bir so'rov 401 bo'ladi. Ikkala tomon bir xil port ko'rishi shart.
       KC_HTTP_PORT: 8081
-    ports: ["8081:8081"]
-    volumes: ["./infra/keycloak:/opt/keycloak/data/import"]
-    depends_on: [keycloak-db]
+      KC_HTTP_ENABLED: "true"
+      # Lokalda hostname tekshiruvini o'chiramiz (localhost, 127.0.0.1, LAN IP —
+      # hammasi ishlasin). Prod'da BU QATOR BO'LMAYDI.
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      # /health/ready endpoint'ini yoqadi (9000-boshqaruv portida) — healthcheck uchun.
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      # Dev rejimida shablon keshini o'chirish — realm o'zgarishi tez ko'rinadi.
+      KC_CACHE: local
+    ports:
+      - "8081:8081"
+    volumes:
+      # Faqat O'QISH uchun (`:ro`) — Keycloak realm faylimizni o'zgartirib
+      # qo'ymasin. Admin UI'da qilingan o'zgarishlar bazada qoladi, faylda emas.
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    healthcheck:
+      # Keycloak 25 image'ida `curl` ham, `wget` ham yo'q (distroless-ga yaqin).
+      # Shuning uchun bash'ning /dev/tcp virtual qurilmasi orqali HTTP so'rov
+      # yozamiz. 9000 — Keycloak 25 dagi alohida "management" porti
+      # (KC_HEALTH_ENABLED=true bilan yoqilgan).
+      # `CMD-SHELL` emas, `CMD bash -c`: /dev/tcp — bash imkoniyati, dash'da yo'q.
+      test:
+        - "CMD"
+        - "bash"
+        - "-c"
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -qE '"status"[[:space:]]*:[[:space:]]*"UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      # Keycloak sekin ko'tariladi (JVM + baza migratsiyasi + realm import).
+      # start_period ichidagi muvaffaqiyatsiz urinishlar "unhealthy" deb sanalmaydi.
+      start_period: 60s
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # Kafka 3.7 — KRaft rejimi (ZooKeeper YO'Q)
+  # --------------------------------------------------------------------------
   kafka:
+    # Rasmiy Apache image'i. (bitnami/kafka 2025-yilda Docker Hub'dan olib
+    # tashlangan.) Env nomlari: `KAFKA_` + property nomi katta harf bilan,
+    # nuqta o'rniga `_` (log.dirs -> KAFKA_LOG_DIRS).
+    # DIQQAT: bitta bo'lsa ham KAFKA_* env berilsa, image ichidagi standart
+    # server.properties ishlatilmaydi — kerakli hamma sozlama shu yerda bo'lishi shart.
     image: apache/kafka:3.7.2
-    container_name: kafka
+    container_name: ed-kafka
     environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      # INTERNAL - boshqa containerlar uchun (kafka:29092), EXTERNAL - host uchun (localhost:9092)
-      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-    ports: ["9092:9092"]
-    volumes: ["kafka:/var/lib/kafka/data"]
+      # --- KRaft: broker ham, controller ham bitta konteynerda (faqat dev uchun) ---
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # Ma'lumotlar papkasi — pastdagi `kafka-data` volume'i shu yerga ulanadi.
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
 
+      # --- Listener'lar: uchta turli maqsad uchun uchta port ---
+      #   PLAINTEXT (9092) — HOST mashinadan (bootRun'dagi ilova, kafka-console-*)
+      #   INTERNAL (29092) — konteynerlar orasidan (kafka-ui)
+      #   CONTROLLER (9093) — KRaft ichki muloqoti
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+
+      # ENG MUHIM QATOR. advertised.listeners — bu "menga qaysi manzil orqali
+      # ulanasan" degan javob, brokerning o'zi mijozga qaytaradi.
+      # Mijoz avval bootstrap-server'ga ulanadi, metadata so'raydi, keyin
+      # AYNAN shu yerdagi manzilga QAYTA ulanadi.
+      # Agar bu yerda `kafka:9092` yozilsa, host mashinadagi ilova `kafka`
+      # nomini DNS'dan topa olmaydi va mangu `Connection to node -1 could not
+      # be established` xatosini beradi. Shuning uchun host uchun `localhost:9092`.
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092,INTERNAL://kafka:29092"
+
+      # Topic'lar KOD bilan yaratiladi (com.example.ed.shared.config.KafkaTopicsConfig).
+      # Avtomatik yaratishni O'CHIRAMIZ: aks holda xato yozilgan topic nomi
+      # (`ed.oder.v1`) jimgina yaratiladi va xato bir hafta ko'rinmaydi.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # Bitta broker — barcha ichki topic'lar uchun replika = 1 bo'lishi shart,
+      # aks holda __consumer_offsets yaratilmaydi va consumer'lar ishlamaydi.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+
+      # Dev'da 0 — consumer ko'tarilishi bilan darrov partition oladi.
+      # Prod'da 3000 (rebalans "to'da bo'lib" bo'lsin).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # Log'ni tez tozalash: dars davomida disk to'lib ketmasin.
+      KAFKA_LOG_RETENTION_HOURS: "168"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # `--list` broker bilan haqiqiy metadata almashinuvini talab qiladi —
+      # ya'ni "port ochiq" emas, "broker so'rovga javob beryapti" degani.
+      # JVM har safar noldan ko'tariladi — shuning uchun timeout kengroq.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 15
+      start_period: 30s
+    networks: [ed-net]
+
+  # --------------------------------------------------------------------------
+  # Kafka UI — brauzerdan topic va xabarlarni ko'rish
+  # --------------------------------------------------------------------------
+  # Dars uchun juda muhim: talaba buyurtma bergach `ed.order.v1` topicini
+  # ochib, OrderCreated event'ining JSON'ini o'z ko'zi bilan ko'radi.
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
+    container_name: ed-kafka-ui
     environment:
-      KAFKA_CLUSTERS_0_NAME: ed
+      KAFKA_CLUSTERS_0_NAME: ed-local
+      # Konteynerlar orasidan ulanamiz — shuning uchun INTERNAL listener (29092),
+      # `localhost:9092` EMAS (u kafka-ui konteynerining o'z localhost'i bo'lardi).
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       DYNAMIC_CONFIG_ENABLED: "true"
-    ports: ["8082:8080"]
-    depends_on: [kafka]
+      AUTH_TYPE: DISABLED
+    ports:
+      - "8082:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # RabbitMQ — vazifa navbati (notification moduli)
+  # --------------------------------------------------------------------------
+  # Kafka — voqealar oqimi (kim eshitsa eshitsin), RabbitMQ — vazifa navbati
+  # (aniq bir ishchi bajarsin, qayta urinsin, xato bo'lsa DLQ'ga tushsin).
+  # `-management` teg'i — brauzerdagi UI bilan birga keladi.
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: rabbitmq
+    image: rabbitmq:3.13-management
+    container_name: ed-rabbitmq
+    hostname: ed-rabbit
     environment:
-      RABBITMQ_DEFAULT_USER: ed_rabbit_user
+      RABBITMQ_DEFAULT_USER: ed
       RABBITMQ_DEFAULT_PASS: root123
-    ports: ["5672:5672", "15672:15672"]
-    volumes: ["rabbit:/var/lib/rabbitmq"]
+      RABBITMQ_DEFAULT_VHOST: "/"
+    ports:
+      - "5672:5672"    # AMQP — ilova shu yerga ulanadi
+      - "15672:15672"  # Management UI — brauzer uchun (ed / root123)
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # `rabbitmq-diagnostics ping` — Erlang node javob beryaptimi.
+      # `check_running` dan yengilroq va dev uchun yetarli.
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # Redis — kesh, savat, taqsimlangan qulf, idempotentlik, rate limit
+  # --------------------------------------------------------------------------
   redis:
     image: redis:7.4-alpine
-    container_name: redis
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
-    ports: ["6379:6379"]
-    volumes: ["redis:/data"]
+    container_name: ed-redis
+    command:
+      - "redis-server"
+      # AOF (append-only file): har bir yozuv diskka tushadi. Konteyner
+      # qayta ko'tarilganda savatlar yo'qolmasin — dars o'rtasida ma'lumot
+      # yo'qolishi chalg'itadi.
+      - "--appendonly"
+      - "yes"
+      # Xotira chegarasi. Redis "cheksiz kesh" emas — chegara bo'lishi SHART,
+      # aks holda u sekin-asta butun RAM'ni yeydi.
+      - "--maxmemory"
+      - "256mb"
+      # Chegaraga yetganda ENG KAM ISHLATILGAN kalitni o'chiradi (LRU).
+      # `noeviction` bo'lsa Redis yozuvni rad etadi va ilova xato beradi;
+      # kesh uchun to'g'ri tanlov — allkeys-lru.
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ed-net]
 
+  # --------------------------------------------------------------------------
+  # Prometheus — metrikalarni yig'adi
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ed-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      # /-/reload orqali konfigni qayta o'qish uchun (konteynerni qayta
+      # ko'tarmasdan yangi target qo'shish mumkin bo'lsin).
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # ENG MUHIM QATOR (Linux uchun). Ilova HOST mashinada (bootRun) ishlaydi,
+      # Prometheus esa konteynerda. Konteyner ichidan hostga chiqish uchun
+      # `host.docker.internal` nomi kerak — macOS/Windows'da Docker uni o'zi
+      # beradi, Linux'da esa AYNAN shu qator bilan qo'lda qo'shiladi.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:9090/-/healthy | grep -q Healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [ed-net]
+
+  # --------------------------------------------------------------------------
+  # Grafana — metrikalarni chizadi
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ed-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: root123
+      # Anonim kirish: dars paytida har safar login qilmaslik uchun.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+      # Ishga tushishi bilan bizning dashboard ochilsin.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/ed.json
+      # Internetga chiqmaydigan muhitda plagin yangilanishini kutmasin.
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      # Provisioning — datasource va dashboard'ni FAYLDAN o'rnatish.
+      # Qo'lda "Add data source" bosish kerak emas: `up -d` dan keyin
+      # hammasi tayyor turadi (Infrastructure as Code).
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/health | grep -q ok"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [ed-net]
+
+  # --------------------------------------------------------------------------
+  # Jaeger — taqsimlangan trassirovka (distributed tracing)
+  # --------------------------------------------------------------------------
+  # Bitta buyurtma order -> inventory -> payment -> notification zanjiridan
+  # o'tadi. Jaeger'da bu zanjir bitta trace sifatida ko'rinadi va qaysi
+  # bosqich sekin ekani darrov ma'lum bo'ladi.
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: ed-jaeger
+    environment:
+      # OTLP qabul qilgichini yoqadi. application.yml da
+      # `management.otlp.tracing.endpoint: http://localhost:4318/v1/traces`
+      # yozilgan — u AYNAN shu portga keladi.
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Dev uchun xotirada saqlash yetarli (konteyner o'chsa trace'lar ketadi).
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "20000"
+    ports:
+      - "16686:16686"  # Jaeger UI — brauzer uchun
+      - "4318:4318"    # OTLP/HTTP — ilova span'larni shu yerga yuboradi
+      - "4317:4317"    # OTLP/gRPC — zaxira variant
+    healthcheck:
+      # 14269 — Jaeger'ning admin porti. `--spider` faylni yuklab olmaydi,
+      # faqat "javob bordimi" ni tekshiradi.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:14269/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [ed-net]
+
+# ============================================================================
+#  Nomlangan volume'lar
+# ============================================================================
+#  Nega bind mount (./data/postgres) emas, nomlangan volume?
+#    1. Fayl egaligi (uid/gid) muammosi bo'lmaydi — Linux'da bind mount
+#       ko'pincha "permission denied" beradi;
+#    2. `docker compose down -v` bitta buyruq bilan hamma narsani tozalaydi —
+#       dars boshida "toza holat" ga qaytish oson;
+#    3. Git repozitoriyga tasodifan baza fayllari tushib qolmaydi.
 volumes:
-  pg: {}
-  kcdb: {}
-  kafka: {}
-  rabbit: {}
-  redis: {}
+  postgres-data:
+  keycloak-db-data:
+  kafka-data:
+  rabbitmq-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+# ============================================================================
+#  Tarmoq
+# ============================================================================
+#  Bitta bridge tarmoq — konteynerlar bir-birini SERVIS NOMI bilan topadi
+#  (kafka, redis, postgres...). Bu Docker'ning ichki DNS'i.
+#  Diqqat: host mashinadagi ilova bu nomlarni KO'RMAYDI — u faqat
+#  `localhost:<chiqarilgan port>` orqali ulanadi.
+networks:
+  ed-net:
+    driver: bridge
+    name: ed-net

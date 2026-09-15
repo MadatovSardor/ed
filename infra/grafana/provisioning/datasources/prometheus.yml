@@ -1,0 +1,12 @@
+# Grafana ishga tushganda Prometheus datasource'ini avtomatik qo'shadi.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    # Konteynerlar orasidan — servis nomi orqali (localhost EMAS).
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

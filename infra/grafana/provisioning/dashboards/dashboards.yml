@@ -1,0 +1,11 @@
+# Shu papkadagi *.json dashboard'larni Grafana'ga yuklaydi.
+apiVersion: 1
+
+providers:
+  - name: ed
+    folder: ""
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards

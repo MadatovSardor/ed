@@ -1,0 +1,25 @@
+# Prometheus konfiguratsiyasi.
+# O'zgartirgandan keyin konteynerni qayta ko'tarish shart emas:
+#   curl -X POST http://localhost:9090/-/reload
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus o'zini o'zi kuzatadi.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Ilova HOST mashinada (`./gradlew :app:bootRun`) ishlaydi, shuning uchun
+  # konteyner ichidan `host.docker.internal` orqali murojaat qilamiz.
+  # Endpoint `spring-boot-starter-actuator` + `micrometer-registry-prometheus`
+  # va `management.endpoints.web.exposure.include: prometheus` bilan ochiladi.
+  # Ilova ishlamayotgan paytda bu target "DOWN" ko'rinadi — bu normal holat.
+  - job_name: ed-app
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          application: ed
