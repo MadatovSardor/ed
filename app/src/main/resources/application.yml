@@ -1,4 +1,193 @@
 spring:
   application:
-    name: ed
+    name: bozor-api
 
+  datasource:
+    url: jdbc:postgresql://localhost:5432/ed_db
+    username: user_ed
+    password: root123
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000
+
+  jpa:
+    # validate, update EMAS. Sxemani faqat Flyway o'zgartiradi (03-modul).
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        # Dars paytida N+1 ni ko'rsatish uchun: true qiling va log'ga qarang
+        generate_statistics: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2s
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    # Producer va consumer sozlamalari kodda: uz.bozor.shared.config
+    admin:
+      fail-fast: false
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: user_ed
+    password: root123
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: auto
+        default-requeue-rejected: false
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: http://localhost:8081/realms/ed
+      client:
+        registration:
+          bozor-worker:
+            provider: keycloak
+            client-id: ed-worker
+            client-secret: ed-worker-secret
+            authorization-grant-type: client_credentials
+            scope: profile
+        provider:
+          keycloak:
+            issuer-uri: http://localhost:8081/realms/ed
+
+  threads:
+    virtual:
+      # Java 21 virtual thread'lar: har bir so'rov o'z virtual thread'ida.
+      enabled: true
+
+server:
+  port: 8080
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+# Graceful shutdown: Kafka consumer offset'ini commit qilib ulgursin (15-modul)
+spring.lifecycle.timeout-per-shutdown-phase: 30s
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db,redis,infrastructure
+  metrics:
+    tags:
+      application: ed-api
+  tracing:
+    sampling:
+      # Dev'da hamma so'rov, prod'da 0.1 atrofida
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: http://localhost:4318/v1/traces
+
+ed:
+  security:
+    audience: ed-api
+    resource-id: ed-api
+    allowed-origins: http://localhost:5173
+  outbox:
+    batch-size: 100
+    send-timeout: 5s
+    retention: 7d
+    max-attempts: 20
+    poll-interval-ms: 1000
+  idempotency:
+    required-paths: /api/orders,/api/payments
+  rate-limit:
+    authenticated-per-minute: 120
+    anonymous-per-minute: 300
+    window-seconds: 60
+  payment:
+    # Soxta provayder: dars uchun Click/Payme o'rniga
+    provider: mock
+    failure-rate: 0.15
+    latency-ms: 400
+  notification:
+    email-from: no-reply@ed.uz
+    sms-provider-url: http://localhost:9099/eskiz
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 20s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      smsGateway:
+        base-config: default
+      paymentGateway:
+        base-config: default
+        failure-rate-threshold: 40
+  retry:
+    configs:
+      default:
+        max-attempts: 3
+        wait-duration: 300ms
+        exponential-backoff-multiplier: 2
+    instances:
+      smsGateway:
+        base-config: default
+      paymentGateway:
+        base-config: default
+  bulkhead:
+    instances:
+      smsGateway:
+        max-concurrent-calls: 10
+      paymentGateway:
+        max-concurrent-calls: 20
+  timelimiter:
+    instances:
+      smsGateway:
+        timeout-duration: 3s
+      paymentGateway:
+        timeout-duration: 5s
+
+logging:
+  level:
+    root: INFO
+    uz.bozor: DEBUG
+    org.springframework.kafka: INFO
+    org.hibernate.SQL: INFO
